@@ -46,6 +46,27 @@ trace = TraceEngine(transcriber=existing_transcriber)
 
 The injected object must expose a `transcribe(audio)` method. The meeting collector will reuse this instance instead of spinning up an extra Whisper model.
 
-```
+## Lifecycle and screen context
 
+`pause_collectors()` pauses capture while keeping shared transcription and
+storage available. `stop()` closes all resources, even when capture was never
+started, and returns whether shutdown succeeded. A closed engine cannot be
+restarted. Injected transcribers must also implement `close()`; an injected
+transcriber prevents creation of an unused second Whisper service.
+
+CPU and CLI transcription support cancellation during shutdown. Requests queued
+at shutdown, or submitted afterward, receive an error result instead of waiting
+indefinitely. Streaming pipe writes are serialized separately from lifecycle
+operations so shutdown can terminate a process blocked on input.
+
+When live UIA and OCR are unavailable, screen context may use an OCR record from
+the preceding hour. Historical content includes its timestamp and recorded
+window, and explicitly does not confirm the current screen. Clipboard, audio
+and window-change events are never presented as OCR. Temporary database
+connections used by this fallback are closed.
+
+Run regression and existing storage/MCP smoke checks with:
+
+```powershell
+python -m unittest discover -s tests -v
 ```

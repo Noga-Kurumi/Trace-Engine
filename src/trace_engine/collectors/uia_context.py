@@ -21,7 +21,10 @@ Presupuesto: el walk corta por max_items, max_chars o un límite de tiempo
 import logging
 import time
 
+from trace_engine.collectors.screen_ocr import ocr_image
+
 logger = logging.getLogger(__name__)
+
 
 _TIME_BUDGET_S = 0.35
 _NAME_MAX_CHARS = 120
@@ -144,8 +147,12 @@ def _active_window_info() -> str:
         import win32process
 
         hwnd = win32gui.GetForegroundWindow()
+        if not hwnd:
+            return ""
         title = win32gui.GetWindowText(hwnd).strip()
         _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        if not pid or pid <= 0:
+            return ""
         import psutil
         app = psutil.Process(pid).name()
         return f"{app} — {title}" if title else app
@@ -204,6 +211,34 @@ def get_screen_context_text() -> str:
             ocr_text = ""
         contenido = ("Texto en pantalla (OCR plano, sin orden visual):\n"
                      + ocr_text) if ocr_text else ""
+
+    # Historical OCR is explicitly dated and never attributed to the live window.
+    if not contenido:
+        db = None
+        try:
+            from datetime import datetime
+            from trace_engine.storage.timeline_db import TimelineDB
+
+            db = TimelineDB()
+            now = time.time()
+            row = db.get_latest_screen_record(now - 300, now)
+            if row is None:
+                row = db.get_latest_screen_record(now - 3600, now)
+            if row is not None:
+                _, timestamp, _, app, title, content = row
+                recorded_at = datetime.fromtimestamp(timestamp).astimezone().isoformat(timespec="seconds")
+                source_window = f"{app} — {title}" if title else (app or "ventana")
+                contenido = (
+                    f"Registro histórico OCR ({recorded_at}), ventana: {source_window}. "
+                    "No confirma el contenido actual de pantalla:\n"
+                    + content[:500]
+                )
+        except Exception as exc:
+            logger.debug("Historical screen fallback failed: %s", exc)
+        finally:
+            if db is not None:
+                db.close()
+
     if not window_info and not contenido:
         return ""
     out = ""

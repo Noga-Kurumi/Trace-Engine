@@ -37,7 +37,7 @@ class TraceEngine:
                 self.config.whisper_stream_exe, self.config.whisper_model_path,
                 language=self.config.whisper_language,
                 n_threads=int(self.config.whisper_threads or 4))
-        if self.config.whisper_model_path:
+        if self.config.whisper_model_path and transcriber is None:
             from trace_engine.transcription import TranscriptionService
             # Preferir whisper_cli_exe (whisper-cli.exe, Vulkan batch).
             cli_exe = self.config.whisper_cli_exe or None
@@ -51,6 +51,8 @@ class TraceEngine:
             self.transcription_service = transcriber
         self.collector = None
         self._started = False
+        self._closed = False
+        self._stop_succeeded = True
 
     @property
     def capabilities(self) -> Dict[str, bool]:
@@ -62,6 +64,8 @@ class TraceEngine:
 
     def start(self) -> None:
         """Inicia los recolectores compatibles sin hacer fallar el núcleo."""
+        if self._closed:
+            raise RuntimeError("TRACE is closed")
         if self._started:
             return
         self._started = True
@@ -79,20 +83,45 @@ class TraceEngine:
             logger.warning("No se pudieron activar los recolectores nativos: %s",
                            exc, exc_info=True)
 
-    def stop(self) -> None:
-        """Detiene recolectores y cierra la base de datos."""
-        if not self._started and self.collector is None:
-            return
+    def pause_collectors(self) -> None:
+        """Pause context capture without closing shared speech or storage."""
         if self.collector is not None:
             self.collector.stop()
             self.collector = None
-        if self.transcription_service is not None:
-            self.transcription_service.close()
-            self.transcription_service = None
-        if self.streaming_transcriber is not None:
-            self.streaming_transcriber.stop()
-        self.db.close()
         self._started = False
+
+    def stop(self) -> bool:
+        """Release resources even when collectors were never started."""
+        if self._closed:
+            return self._stop_succeeded
+        success = True
+        try:
+            self.pause_collectors()
+        except Exception:
+            logger.exception("Failed to stop context collectors")
+            success = False
+        if self.transcription_service is not None:
+            try:
+                success = (self.transcription_service.close() is not False) and success
+            except Exception:
+                logger.exception("Failed to close transcription service")
+                success = False
+            finally:
+                self.transcription_service = None
+        if self.streaming_transcriber is not None:
+            try:
+                self.streaming_transcriber.stop()
+            except Exception:
+                logger.exception("Failed to stop streaming transcription")
+                success = False
+        try:
+            self.db.close()
+        except Exception:
+            logger.exception("Failed to close timeline database")
+            success = False
+        self._closed = True
+        self._stop_succeeded = success
+        return success
 
     def insert(self, source: str, content: str, app_name: str = "",
                window_title: str = "", timestamp: Optional[float] = None) -> bool:

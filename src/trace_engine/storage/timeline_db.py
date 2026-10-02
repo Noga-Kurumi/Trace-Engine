@@ -249,6 +249,18 @@ class TimelineDB:
                 (float(start_epoch), float(end_epoch), int(limit)))
             return cur.fetchall()
 
+    def get_latest_screen_record(self, start_epoch: float, end_epoch: float) -> Optional[Row]:
+        """Return the newest OCR record in the interval, with deterministic ties."""
+        with self._lock:
+            cursor = self._conn.execute(
+                f"SELECT {_SELECT_COLS} FROM timeline"
+                " WHERE timestamp BETWEEN ? AND ? AND source = ?"
+                " AND length(trim(content)) > 0"
+                " ORDER BY timestamp DESC, id DESC LIMIT 1",
+                (float(start_epoch), float(end_epoch), "ocr"),
+            )
+            return cursor.fetchone()
+
     # --------------------------------------------------------------- formato
 
     @staticmethod

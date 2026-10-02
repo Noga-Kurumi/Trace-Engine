@@ -142,7 +142,8 @@ def _transcribe_mp_worker(audio: Any) -> str:
 
 def _dummy_mp_worker() -> None:
     """Tarea vacía utilizada para forzar la inicialización temprana del pool."""
-    pass
+    if _mp_model is None:
+        raise RuntimeError("Whisper model initialization failed")
 
 
 # ---------------------------------------------------------------------------
@@ -156,63 +157,57 @@ def _transcribe_via_cli(
     *,
     language: str = "es",
     n_threads: int = 4,
+    stop_event: Optional[threading.Event] = None,
 ) -> str:
-    """Invoca whisper-cli.exe con el audio como WAV temporal y devuelve el texto."""
-    # Escribir WAV temporal
+    """Run batch Whisper with bounded execution and cooperative cancellation."""
     fd, wav_path = tempfile.mkstemp(suffix=".wav", prefix="trace_asr_")
     os.close(fd)
+    process = None
     try:
         _write_wav(wav_path, audio)
-
-        abs_model = os.path.abspath(model_path)
-        cmd = [
-            cli_exe,
-            "-m", abs_model,
-            "-f", wav_path,
-            "-l", language,
-            "-t", str(n_threads),
-            "--no-timestamps",
-            "--no-prints",
-            "-bs", "1",
-            "-bo", "1",
-            "-fa",
-        ]
-        logger.debug("[TRACE-ASR] CLI cmd: %s", " ".join(cmd))
-
-        # Directorio del exe para que encuentre las DLLs Vulkan
-        cwd = os.path.dirname(cli_exe)
-
+        cmd = [cli_exe, "-m", os.path.abspath(model_path), "-f", wav_path,
+               "-l", language, "-t", str(n_threads), "--no-timestamps",
+               "--no-prints", "-bs", "1", "-bo", "1", "-fa"]
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-        result = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=cwd,
-            timeout=120,
-            creationflags=creationflags,
+        process = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            cwd=os.path.dirname(os.path.abspath(cli_exe)), creationflags=creationflags,
         )
-        stderr_out = result.stderr.decode("utf-8", errors="replace")
-        if result.returncode != 0:
-            # whisper-cli retorna 1 incluso en éxito si hay warnings de Vulkan
-            # Solo es error real si stdout está vacío Y stderr tiene "error"
-            if "error" in stderr_out.lower() and not result.stdout.strip():
-                raise RuntimeError(
-                    f"whisper-cli falló (rc={result.returncode}): {stderr_out[:300]}"
-                )
-
-        # Intentar UTF-8 primero; si falla usar cp1252 (OEM Windows)
+        deadline = time.monotonic() + 120
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                raise RuntimeError("Transcription cancelled by shutdown")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Whisper CLI timed out")
+            try:
+                stdout, stderr = process.communicate(timeout=min(0.1, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        stderr_out = stderr.decode("utf-8", errors="replace")
+        if process.returncode != 0 and not stdout.strip():
+            raise RuntimeError(
+                f"Whisper CLI failed (rc={process.returncode}): {stderr_out[:300]}"
+            )
         try:
-            text = result.stdout.decode("utf-8").strip()
+            result = stdout.decode("utf-8").strip()
         except UnicodeDecodeError:
-            text = result.stdout.decode("cp1252", errors="replace").strip()
+            result = stdout.decode("cp1252", errors="replace").strip()
         if stderr_out:
-            logger.debug("[TRACE-ASR] stderr: %s", stderr_out[:200])
-        return text
+            logger.debug("Whisper CLI stderr: %s", stderr_out[:200])
+        return result
     finally:
         try:
-            os.unlink(wav_path)
-        except OSError:
-            pass
+            if process is not None:
+                if process.poll() is None:
+                    process.kill()
+                process.communicate(timeout=1)
+        finally:
+            try:
+                os.unlink(wav_path)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +235,7 @@ class TranscriptionService:
         self.n_threads = int(n_threads or 4)
         self.language = language
         self.whisper_cli_exe = whisper_cli_exe
+        self.model = model
 
         self._queue: "queue.PriorityQueue[_Request]" = queue.PriorityQueue()
         self._sequence = 0
@@ -249,7 +245,9 @@ class TranscriptionService:
                                         name="trace-transcription")
         
         self._pool = None
-        if not self.whisper_cli_exe:
+        if self.model is not None:
+            logger.info("[TRACE-ASR] Backend: modelo in-memory inyectado")
+        elif not self.whisper_cli_exe:
             # Backend CPU (pywhispercpp aislado en proceso)
             import multiprocessing as mp
             import concurrent.futures
@@ -296,10 +294,13 @@ class TranscriptionService:
         """Encola audio y devuelve una cola con exactamente un resultado."""
         result_queue: "queue.Queue[TranscriptionResult]" = queue.Queue(maxsize=1)
         with self._sequence_lock:
+            if self._stop.is_set():
+                result_queue.put(TranscriptionResult("", source, error="Transcription service is closed"))
+                return result_queue
             sequence = self._sequence
             self._sequence += 1
-        self._queue.put(_Request(int(priority), sequence, audio, source,
-                                 result_queue))
+            self._queue.put(_Request(int(priority), sequence, audio, source,
+                                     result_queue))
         return result_queue
 
     def transcribe(
@@ -311,7 +312,10 @@ class TranscriptionService:
     ) -> TranscriptionResult:
         """API bloqueante para consumidores que necesitan el texto."""
         result_queue = self.submit(audio, source=source, priority=priority)
-        return result_queue.get()
+        try:
+            return result_queue.get(timeout=120)
+        except queue.Empty:
+            return TranscriptionResult("", source, error="Transcription timed out")
 
     # ------------------------------------------------------------------
     # Worker interno
@@ -326,7 +330,18 @@ class TranscriptionService:
             try:
                 started = time.perf_counter()
 
-                if self.whisper_cli_exe:
+                if self.model is not None:
+                    # ── Backend directo (modelo inyectado / tests) ────
+                    segments = self.model.transcribe(request.audio)
+                    text = " ".join(
+                        segment.text for segment in segments
+                        if getattr(segment, "text", "").strip()
+                    ).strip()
+                    result = TranscriptionResult(
+                        text, request.source,
+                        duration_seconds=time.perf_counter() - started,
+                    )
+                elif self.whisper_cli_exe:
                     # ── Backend GPU (Vulkan) ──────────────────────────
                     try:
                         text = _transcribe_via_cli(
@@ -335,6 +350,7 @@ class TranscriptionService:
                             request.audio,
                             language=self.language,
                             n_threads=self.n_threads,
+                            stop_event=self._stop,
                         )
                         elapsed = time.perf_counter() - started
                         logger.info(
@@ -355,7 +371,15 @@ class TranscriptionService:
                 else:
                     # ── Backend CPU (pywhispercpp aislado) ────────────
                     future = self._pool.submit(_transcribe_mp_worker, request.audio)
-                    text = future.result()
+                    while True:
+                        if self._stop.is_set():
+                            future.cancel()
+                            raise RuntimeError("Transcription cancelled by shutdown")
+                        try:
+                            text = future.result(timeout=0.1)
+                            break
+                        except TimeoutError:
+                            continue
                     result = TranscriptionResult(
                         text, request.source,
                         duration_seconds=time.perf_counter() - started)
@@ -369,10 +393,33 @@ class TranscriptionService:
             finally:
                 self._queue.task_done()
 
-    def close(self) -> None:
-        self._stop.set()
+    def close(self) -> bool:
+        with self._sequence_lock:
+            self._stop.set()
+            while True:
+                try:
+                    request = self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                request.future.put(TranscriptionResult("", request.source, error="Transcription service closed"))
+                self._queue.task_done()
+        if self._pool is not None:
+            pool, self._pool = self._pool, None
+            # Python 3.14 owns termination; retain bounded support for 3.11.
+            terminate = getattr(pool, "terminate_workers", None)
+            if callable(terminate):
+                terminate()
+            else:
+                processes = list((getattr(pool, "_processes", None) or {}).values())
+                for process in processes:
+                    if process.is_alive():
+                        process.terminate()
+                pool.shutdown(wait=False, cancel_futures=True)
+                for process in processes:
+                    process.join(timeout=1)
         if self._worker.is_alive():
-            self._worker.join(timeout=5)
+            self._worker.join(timeout=3)
+        return not self._worker.is_alive()
 
     @property
     def pending_count(self) -> int:

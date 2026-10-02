@@ -22,6 +22,7 @@ class StreamingTranscriber:
         self.n_threads = int(n_threads or 4)
         self._process: Optional[subprocess.Popen] = None
         self._lock = threading.Lock()
+        self._write_lock = threading.Lock()
         self._reader: Optional[threading.Thread] = None
 
     @property
@@ -40,9 +41,10 @@ class StreamingTranscriber:
                    "--sample-rate", "16000", "--vad", "--step", "200",
                    "--length", "2000"]
             try:
-                creationflags = (
-                    subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-                )
+                creationflags = 0
+                if os.name == "nt":
+                    below_normal = getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0x00004000)
+                    creationflags = subprocess.CREATE_NO_WINDOW | below_normal
                 self._process = subprocess.Popen(
                     cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE, creationflags=creationflags)
@@ -62,15 +64,17 @@ class StreamingTranscriber:
 
     def send(self, audio) -> None:
         with self._lock:
-            if not self.running or self._process.stdin is None:
+            process = self._process
+            if process is None or process.poll() is not None or process.stdin is None:
                 return
-            try:
-                import numpy as np
-                data = np.ascontiguousarray(audio, dtype=np.float32)
-                self._process.stdin.write(data.tobytes())
-                self._process.stdin.flush()
-            except (BrokenPipeError, OSError):
-                logger.warning("[TRACE-ASR] Streaming perdió el proceso Whisper")
+        # Never hold the lifecycle lock during a potentially blocked pipe write.
+        try:
+            import numpy as np
+            with self._write_lock:
+                process.stdin.write(np.ascontiguousarray(audio, dtype=np.float32).tobytes())
+                process.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            logger.warning("Whisper streaming pipe closed")
 
     def stop(self) -> None:
         with self._lock:
@@ -78,15 +82,22 @@ class StreamingTranscriber:
             if process is None:
                 return
             try:
-                if process.stdin:
-                    process.stdin.close()
-                process.terminate()
-                process.wait(timeout=3)
-            except Exception:
-                try:
-                    process.kill()
-                except Exception:
-                    pass
+                if process.poll() is None:
+                    process.terminate()
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=1)
+            finally:
+                for pipe in (process.stdin, process.stdout, process.stderr):
+                    if pipe is not None:
+                        try:
+                            pipe.close()
+                        except (OSError, ValueError):
+                            logger.debug("Whisper stream pipe already closed")
+            reader, self._reader = self._reader, None
+        if reader is not None and reader is not threading.current_thread():
+            reader.join(timeout=1)
 
     @staticmethod
     def _read_output(process, callback) -> None:

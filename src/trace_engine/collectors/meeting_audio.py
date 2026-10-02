@@ -181,6 +181,9 @@ class MeetingAudioCollector:
         else:
             self._capture_paused.clear()
 
+    # Alias de compatibilidad
+    set_ptt_active = set_capture_paused
+
     # ------------------------------------------------------------- detección
 
     def _poll_loop(self) -> None:
