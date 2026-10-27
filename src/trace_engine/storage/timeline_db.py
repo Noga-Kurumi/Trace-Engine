@@ -25,6 +25,7 @@ API:
 """
 
 import logging
+import json
 import os
 import sqlite3
 import threading
@@ -51,6 +52,17 @@ CREATE TABLE IF NOT EXISTS timeline (
     content TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_timeline_timestamp ON timeline(timestamp);
+CREATE INDEX IF NOT EXISTS idx_timeline_source_time ON timeline(source, timestamp, id);
+
+CREATE TABLE IF NOT EXISTS timeline_observations (
+    event_id INTEGER PRIMARY KEY,
+    processed_at REAL NOT NULL,
+    window_id TEXT NOT NULL,
+    monitor_json TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS timeline_observation_delete AFTER DELETE ON timeline BEGIN
+    DELETE FROM timeline_observations WHERE event_id=old.id;
+END;
 
 CREATE TABLE IF NOT EXISTS window_sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -61,6 +73,8 @@ CREATE TABLE IF NOT EXISTS window_sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_window_sessions_time
     ON window_sessions(started_at, ended_at);
+CREATE INDEX IF NOT EXISTS idx_window_sessions_lookup
+    ON window_sessions(app_name, window_title, started_at);
 
 CREATE TABLE IF NOT EXISTS meeting_sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -72,6 +86,8 @@ CREATE TABLE IF NOT EXISTS meeting_sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_meeting_sessions_time
     ON meeting_sessions(started_at, ended_at);
+CREATE INDEX IF NOT EXISTS idx_meeting_sessions_lookup
+    ON meeting_sessions(app_name, started_at);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS timeline_fts USING fts5(
     content, app_name, window_title,
@@ -112,25 +128,34 @@ class TimelineDB:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
         with self._lock:
-            self._conn.executescript(_SCHEMA)
+            from trace_engine.work_context import SCHEMA as WORK_SCHEMA
+            from trace_engine.meeting_context import SCHEMA as MEETING_SCHEMA
+            had_work_index=self._conn.execute("SELECT 1 FROM sqlite_master WHERE name='work_operations_fts'").fetchone()
+            self._conn.executescript(_SCHEMA + WORK_SCHEMA + MEETING_SCHEMA)
+            if not had_work_index:
+                self._conn.execute("INSERT INTO work_operations_fts(work_operations_fts) VALUES('rebuild')")
             self._conn.commit()
         logger.info("✅ [TIMELINE] Base de datos lista en %s", self.db_path)
 
     # ------------------------------------------------------------- escritura
 
     def insert(self, source: str, app_name: Optional[str], window_title: Optional[str],
-               content: Optional[str], timestamp: Optional[float] = None) -> bool:
+               content: Optional[str], timestamp: Optional[float] = None, *, observation=None) -> bool:
         """Inserta un evento. Ignora content vacío/None (devuelve False)."""
         if not content or not str(content).strip():
             return False
         if source not in SOURCES:
             raise ValueError(f"source inválido: {source!r} (válidos: {SOURCES})")
         ts = float(timestamp) if timestamp is not None else time.time()
-        with self._lock:
-            self._conn.execute(
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
                 "INSERT INTO timeline (timestamp, source, app_name, window_title, content)"
                 " VALUES (?, ?, ?, ?, ?)",
                 (ts, source, app_name or "", window_title or "", str(content).strip()))
+            if observation is not None:
+                self._conn.execute('INSERT INTO timeline_observations VALUES (?,?,?,?)',
+                    (cursor.lastrowid, float(observation['processed_at']), str(observation['window_id']),
+                     json.dumps(observation['monitor'], separators=(',',':'))))
             self._conn.commit()
         return True
 
@@ -149,12 +174,21 @@ class TimelineDB:
             self._conn.execute(
                 "DELETE FROM meeting_sessions WHERE COALESCE(ended_at, started_at) < ?",
                 (cutoff,))
+            self._conn.execute('DELETE FROM work_tasks WHERE updated < ?', (cutoff,))
+            self._conn.execute('DELETE FROM work_documents WHERE NOT EXISTS '
+                '(SELECT 1 FROM work_operations WHERE document_ref=work_documents.ref)')
             self._conn.commit()
             deleted = cur.rowcount
         if deleted:
             logger.info("🧹 [TIMELINE] Limpieza: %d registros con más de %.0fh borrados",
                         deleted, retention_hours)
         return deleted
+
+    def clear_all_records(self):
+        """Explicit audit deletion also removes task/document associations."""
+        with self._lock,self._conn:
+            for table in ('timeline','window_sessions','meeting_sessions','work_tasks','work_documents'):
+                self._conn.execute('DELETE FROM '+table)
 
     def start_window_session(self, app_name: str, window_title: str,
                              started_at: Optional[float] = None) -> int:
@@ -185,6 +219,14 @@ class TimelineDB:
                 "ORDER BY started_at ASC LIMIT ?",
                 (float(end_epoch), float(end_epoch), float(start_epoch), int(limit)))
             return cur.fetchall()
+
+    def record_meeting_segment(self, segment, text):
+        from trace_engine.meeting_context import insert_segment
+        return insert_segment(self,segment,text)
+
+    def update_meeting_state(self,session_id,**values):
+        from trace_engine.meeting_context import state
+        return state(self,session_id,**values)
 
     def start_meeting_session(self, app_name: str, channel_name: str = "",
                               participants: str = "",

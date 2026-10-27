@@ -36,6 +36,8 @@ class ClipboardCollector:
         self.redact_sensitive = bool(self.config.get("clipboard_redact_sensitive", True))
         self._thread: Optional[threading.Thread] = None
         self._hwnd = None
+        self._stop_event = threading.Event()
+        self._class_name = f"{_CLASS_NAME}_{id(self):x}"
         self._last_hash: Optional[bytes] = None
 
     # ------------------------------------------------------------ lifecycle
@@ -43,20 +45,25 @@ class ClipboardCollector:
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
+        self._stop_event.clear()
         self._thread = threading.Thread(
             target=self._run, daemon=True, name="collector-clipboard")
         self._thread.start()
 
     def stop(self) -> None:
+        self._stop_event.set()
         if self._hwnd:
             try:
                 import win32gui
-
                 win32gui.PostMessage(self._hwnd, WM_CLOSE, 0, 0)
-            except Exception as e:
-                logger.warning("⚠️ [CLIPBOARD] Error cerrando la ventana listener: %s", e)
-        if self._thread:
-            self._thread.join(timeout=5)
+            except Exception as error:
+                logger.debug("Clipboard close already in progress: %s", error)
+        thread = self._thread
+        if thread and thread is not threading.current_thread():
+            thread.join(timeout=5)
+            if thread.is_alive():
+                logger.warning("Clipboard listener still stopping")
+                return
         self._thread = None
         self._hwnd = None
 
@@ -65,34 +72,48 @@ class ClipboardCollector:
     def _run(self) -> None:
         import win32con
         import win32gui
-
+        from ctypes import wintypes
+        if self._stop_event.is_set():
+            return
         user32 = ctypes.windll.user32
+        user32.AddClipboardFormatListener.argtypes = [wintypes.HWND]
+        user32.RemoveClipboardFormatListener.argtypes = [wintypes.HWND]
         hinst = win32gui.GetModuleHandle(None)
-
         wc = win32gui.WNDCLASS()
         wc.lpfnWndProc = self._wnd_proc
-        wc.lpszClassName = _CLASS_NAME
+        wc.lpszClassName = self._class_name
         wc.hInstance = hinst
         try:
             class_atom = win32gui.RegisterClass(wc)
-        except Exception as e:
-            logger.error("❌ [CLIPBOARD] No se pudo registrar la clase de ventana: %s", e,
-                         exc_info=True)
+        except Exception:
+            logger.exception("Clipboard window class registration failed")
             return
-
-        self._hwnd = win32gui.CreateWindowEx(
-            0, class_atom, _CLASS_NAME, 0, 0, 0, 0, 0,
-            win32con.HWND_MESSAGE, 0, hinst, None)
-        if not user32.AddClipboardFormatListener(self._hwnd):
-            logger.error("❌ [CLIPBOARD] AddClipboardFormatListener falló; recolector inactivo")
-            return
-        logger.info("✅ [CLIPBOARD] Listener de portapapeles activo")
         try:
-            win32gui.PumpMessages()
-        except Exception as e:
-            logger.error("❌ [CLIPBOARD] Error en el message loop: %s", e, exc_info=True)
+            self._hwnd = win32gui.CreateWindowEx(
+                0, class_atom, self._class_name, 0, 0, 0, 0, 0,
+                win32con.HWND_MESSAGE, 0, hinst, None)
+            if self._stop_event.is_set():
+                return
+            if not user32.AddClipboardFormatListener(self._hwnd):
+                logger.error("AddClipboardFormatListener failed")
+                return
+            logger.info("Clipboard listener active")
+            if not self._stop_event.is_set():
+                win32gui.PumpMessages()
+        except Exception:
+            logger.exception("Clipboard listener failed")
         finally:
-            logger.info("🛑 [CLIPBOARD] Listener de portapapeles detenido")
+            hwnd = self._hwnd
+            try:
+                if hwnd and win32gui.IsWindow(hwnd):
+                    win32gui.DestroyWindow(hwnd)
+            finally:
+                self._hwnd = None
+                try:
+                    win32gui.UnregisterClass(self._class_name, hinst)
+                except Exception:
+                    logger.exception("Clipboard window class cleanup failed")
+            logger.info("Clipboard listener stopped")
 
     def _wnd_proc(self, hwnd, msg, wparam, lparam):
         import win32gui

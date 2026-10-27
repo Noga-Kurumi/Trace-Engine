@@ -21,7 +21,7 @@ Presupuesto: el walk corta por max_items, max_chars o un límite de tiempo
 import logging
 import time
 
-from trace_engine.collectors.screen_ocr import ocr_image
+from trace_engine.collectors.screen_ocr import ocr_image, screen_capture_scope, is_excluded_window
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +95,7 @@ def get_uia_text(max_chars: int = 2000, max_items: int = 120) -> str:
             return ""
         try:
             hwnd = win32gui.GetForegroundWindow()
-            if not hwnd:
+            if not hwnd or is_excluded_window(hwnd):
                 return ""
             root = uia.ElementFromHandle(hwnd)
         except Exception as e:
@@ -147,7 +147,7 @@ def _active_window_info() -> str:
         import win32process
 
         hwnd = win32gui.GetForegroundWindow()
-        if not hwnd:
+        if not hwnd or is_excluded_window(hwnd):
             return ""
         title = win32gui.GetWindowText(hwnd).strip()
         _, pid = win32process.GetWindowThreadProcessId(hwnd)
@@ -174,7 +174,8 @@ def _ocr_screen_text(max_chars: int = 800) -> str:
             real = sct.monitors[1:]
             monitor = next(
                 (m for m in real if m["left"] == 0 and m["top"] == 0), real[0])
-            sct_img = sct.grab(monitor)
+            with screen_capture_scope():
+                sct_img = sct.grab(monitor)
             img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
         raw_text = ocr_image(img)
         # Sanitizar: remover líneas/espacios repetidos

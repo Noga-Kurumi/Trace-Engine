@@ -44,9 +44,13 @@ def get_foreground_window_info() -> tuple:
     activa del momento). Errores hacia afuera para que el llamador loguee.
     """
     import win32gui
-    import win32process
+    return get_window_info(win32gui.GetForegroundWindow())
 
-    hwnd = win32gui.GetForegroundWindow()
+
+def get_window_info(hwnd) -> tuple:
+    """Read metadata for the SAME handle supplied by a capture snapshot."""
+    import win32gui
+    import win32process
     title = win32gui.GetWindowText(hwnd) or "" if hwnd else ""
     app_name = ""
     try:

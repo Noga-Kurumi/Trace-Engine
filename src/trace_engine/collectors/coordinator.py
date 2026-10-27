@@ -26,7 +26,8 @@ class ContextCollector:
 
     def __init__(self, config=None, db: Optional[TimelineDB] = None):
         self.config = config or {}
-        self.db = db or TimelineDB()
+        self._owns_db = db is None
+        self.db = db if db is not None else TimelineDB()
         self.retention_hours = float(self.config.get("timeline_retention_hours", 72))
         self._collectors = []
         self._cleanup_thread: Optional[threading.Thread] = None
@@ -102,10 +103,11 @@ class ContextCollector:
         if self._cleanup_thread:
             self._cleanup_thread.join(timeout=5)
             self._cleanup_thread = None
-        try:
-            self.db.close()
-        except Exception as e:
-            logger.warning("⚠️ [CONTEXT] Error cerrando la base del timeline: %s", e)
+        if self._owns_db:
+            try:
+                self.db.close()
+            except Exception as e:
+                logger.warning("⚠️ [CONTEXT] Error cerrando la base del timeline: %s", e)
 
     # --------------------------------------------------------------- limpieza
 
@@ -130,3 +132,8 @@ class ContextCollector:
                 except Exception as e:
                     logger.error("❌ [CONTEXT] Error en set_ptt_active(%s) de %s: %s",
                                  active, type(collector).__name__, e, exc_info=True)
+
+    def set_playback_active(self,active):
+        for collector in self._collectors:
+            setter=getattr(collector,'set_playback_active',None)
+            if callable(setter):setter(active)

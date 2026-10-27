@@ -38,8 +38,9 @@ class StreamingTranscriber:
                 return False
             cmd = [self.executable, "-m", self.model_path, "-l", self.language,
                    "-t", str(self.n_threads), "-i", "-", "--format", "f32",
-                   "--sample-rate", "16000", "--vad", "--step", "200",
-                   "--length", "2000"]
+                   "--sample-rate", "16000", "--step", "750",
+                   "--length", "4000", "--audio-ctx", "256",
+                   "--max-tokens", "128", "--no-fallback"]
             try:
                 creationflags = 0
                 if os.name == "nt":
@@ -101,19 +102,41 @@ class StreamingTranscriber:
 
     @staticmethod
     def _read_output(process, callback) -> None:
+        """Decode transport frames, including CR repaints, without leaking controls."""
+        import codecs
+        import re
         if process.stdout is None:
             return
-        for raw in iter(process.stdout.readline, b""):
-            text = raw.decode("utf-8", errors="ignore").strip()
-            # Whisper stream outputs lines like: [00:00:00.000 --> 00:00:01.000] Hello
-            if text.startswith("[") and "-->" in text and "]" in text:
-                text = text.split("]", 1)[1].strip()
-            elif text.startswith("["):
-                # Ignorar otras líneas de depuración que empiezan con [
-                continue
-                
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        pending = ""
+        ansi = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+        marker = re.compile(r"### Transcription \d+ (?:END|START \| t0 = \d+ ms \| t1 = \d+ ms)")
+        timestamp = re.compile(r"^\[\d{2}:\d{2}:\d{2}\.\d{3} --> \d{2}:\d{2}:\d{2}\.\d{3}\]\s*")
+        def deliver(frame):
+            text = ansi.sub("", frame).strip()
+            if not text or marker.fullmatch(text):
+                return
+            text, count = timestamp.subn("", text, count=1)
+            if not count and text.startswith("["):
+                return
             if text:
                 callback(text)
+        read = getattr(process.stdout, 'read1', process.stdout.read)
+        while True:
+            try:
+                raw = read(4096)
+            except (OSError, ValueError):
+                break
+            if not raw:
+                pending += decoder.decode(b"", final=True)
+                if pending:
+                    deliver(pending)
+                break
+            pending += decoder.decode(raw)
+            frames = re.split(r"[\r\n]", pending)
+            pending = frames.pop()
+            for frame in frames:
+                deliver(frame)
 
     @staticmethod
     def _drain_stderr(process) -> None:

@@ -1,7 +1,7 @@
 """Recolector pasivo: OCR de pantalla a intervalo (Windows.Media.Ocr).
 
 Cada `ocr_interval_seconds` (config, default 12): captura el monitor
-principal con mss, hashea la imagen reducida en grises (blake2b — rápido y
+de la ventana activa con mss, hashea la imagen reducida en grises (blake2b — rápido y
 barato) y, solo si la pantalla cambió, corre el OCR NATIVO de Windows
 (paquete `winsdk`, winsdk.windows.media.ocr) en español si el idioma está
 disponible (fallback al perfil del usuario). Inserta source='ocr' con
@@ -20,14 +20,64 @@ import hashlib
 import io
 import logging
 import threading
+import time
+from dataclasses import dataclass
 from typing import Optional
 
-from trace_engine.collectors.window_change import get_foreground_window_info
+from trace_engine.collectors.window_change import get_window_info
 from trace_engine.storage.timeline_db import TimelineDB
 
 logger = logging.getLogger(__name__)
 
+# A host may exclude its own overlays only for the captured frame. Standalone
+# TRACE keeps its original behavior and never depends on a host GUI package.
+from contextlib import nullcontext
+_capture_scope = nullcontext
+_excluded_window = lambda hwnd: False
+
+
+def configure_capture_policy(capture_scope, excluded_window):
+    global _capture_scope, _excluded_window
+    _capture_scope, _excluded_window = capture_scope, excluded_window
+
+
+def screen_capture_scope():
+    return _capture_scope()
+
+
+def is_excluded_window(hwnd):
+    return bool(_excluded_window(hwnd))
+
 _HASH_WIDTH = 320  # ancho del thumbnail en grises para el hash de cambio
+
+
+@dataclass(frozen=True)
+class Observation:
+    hwnd: int
+    app: str
+    title: str
+    bounds: tuple
+    captured_at: float
+
+    @property
+    def identity(self):
+        return self.hwnd, self.app, self.title, self.bounds
+
+    @property
+    def monitor(self):
+        left, top, right, bottom = self.bounds
+        return dict(left=left, top=top, width=right-left, height=bottom-top)
+
+
+def foreground_observation():
+    import win32api
+    import win32gui
+    hwnd = win32gui.GetForegroundWindow()
+    if not hwnd:
+        raise OSError('No foreground window to identify the capture')
+    app, title = get_window_info(hwnd)
+    bounds = win32api.GetMonitorInfo(win32api.MonitorFromWindow(hwnd, 2))['Monitor']
+    return Observation(hwnd, app, title, tuple(bounds), time.time())
 
 # Motor OCR compartido (lazy; thread-safe para el recolector y api_brain).
 _engine_lock = threading.Lock()
@@ -122,6 +172,8 @@ class ScreenOcrCollector:
         self._stop_event = threading.Event()
         self._last_hash: Optional[bytes] = None
         self._last_text = ""
+        self._last_capture_identity = None
+        self._last_text_identity = None
         self.excluded_apps = {str(x).lower() for x in self.config.get("trace_excluded_apps", [])}
         self._sct = None
         self._engine = None       # OcrEngine compartido (get_ocr_engine)
@@ -169,34 +221,44 @@ class ScreenOcrCollector:
 
     def _tick(self, loop) -> None:
         try:
-            png_bytes, changed = self._capture_if_changed()
+            observed = foreground_observation()
+            if (not observed.app or is_excluded_window(observed.hwnd)
+                    or observed.app.lower() in self.excluded_apps):
+                return
+            png_bytes, changed = self._capture_if_changed(observed)
         except Exception as e:
             logger.warning("⚠️ [OCR] Captura fallida, saltando frame: %s", e)
             return
         if not changed:
             return
-        text = loop.run_until_complete(_ocr_png_bytes(self._engine, png_bytes))
+        if foreground_observation().identity != observed.identity:
+            self._last_hash = None
+            return
+        try:
+            text = loop.run_until_complete(_ocr_png_bytes(self._engine, png_bytes))
+        except Exception:
+            self._last_hash = None
+            raise
+        if foreground_observation().identity != observed.identity or self._stop_event.is_set():
+            self._last_hash = None
+            return
         text = " ".join((text or "").split())
         if not text:
             return
         if len(text) > self.max_chars:
             text = text[:self.max_chars]
-        try:
-            app_name, title = get_foreground_window_info()
-        except Exception as e:
-            logger.warning("⚠️ [OCR] Sin ventana activa para etiquetar: %s", e)
-            app_name, title = "", ""
-        if app_name.lower() in self.excluded_apps:
-            return
         # Cambios visuales menores pueden producir el mismo texto. No lo
         # vuelvas a almacenar si el OCR no aporta contexto nuevo.
-        if text == self._last_text:
+        if text == self._last_text and observed.identity == self._last_text_identity:
             return
-        self._last_text = text
-        if self.db.insert("ocr", app_name, title, text):
-            logger.debug("[OCR] Pantalla: %d chars (%s - %s)", len(text), app_name, title[:40])
+        if self.db.insert("ocr", observed.app, observed.title, text, observed.captured_at,
+                observation={'processed_at':time.time(), 'window_id':str(observed.hwnd),
+                             'monitor':observed.monitor}):
+            self._last_text = text
+            self._last_text_identity = observed.identity
+            logger.debug("[OCR] Pantalla: %d chars (%s - %s)", len(text), observed.app, observed.title[:40])
 
-    def _capture_if_changed(self) -> tuple:
+    def _capture_if_changed(self, observation=None) -> tuple:
         """(png_bytes, changed): captura + hash del thumbnail en grises.
 
         El hash corre sobre la imagen reescalada a _HASH_WIDTH px en escala de
@@ -207,9 +269,10 @@ class ScreenOcrCollector:
         if self._sct is None:
             import mss
             self._sct = mss.mss()
-        monitor = self._sct.monitors[1]  # monitor principal
+        monitor = observation.monitor if observation else self._sct.monitors[1]
         try:
-            shot = self._sct.grab(monitor)
+            with screen_capture_scope():
+                shot = self._sct.grab(monitor)
         except Exception as e:
             # BitBlt u otro error GDI: reinicializar contexto mss en el próximo tick.
             logger.warning("⚠️ [OCR] Error en grab (BitBlt?), reiniciando mss: %s", e)
@@ -226,9 +289,11 @@ class ScreenOcrCollector:
         thumb = thumb.resize((_HASH_WIDTH, max(1, int(thumb.height * ratio))),
                              Image.Resampling.BILINEAR)
         digest = hashlib.blake2b(thumb.tobytes(), digest_size=16).digest()
-        if digest == self._last_hash:
+        identity = observation.identity if observation else None
+        if digest == self._last_hash and identity == self._last_capture_identity:
             return b"", False
         self._last_hash = digest
+        self._last_capture_identity = identity
 
         buffer = io.BytesIO()
         img.save(buffer, format="PNG")

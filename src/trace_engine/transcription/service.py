@@ -1,7 +1,10 @@
-"""Servicio Whisper compartido con cola de prioridades.
+"""STT compartido con cola de prioridades para voz interactiva y reuniones.
 
 TRACE es dueño del modelo y de su ciclo de vida. Los consumidores solo
-encolan audio; nunca crean instancias Whisper por su cuenta.
+encolan audio; nunca crean otra instancia del modelo por su cuenta.
+
+El consumidor puede inyectar un modelo nativo (Whisper o Nemotron en Lindsay).
+Sin modelo inyectado, los siguientes adaptadores Whisper mantienen la API:
 
 Backend disponibles (en orden de preferencia):
   1. whisper-cli.exe (Vulkan/GPU) — si se proporciona ``whisper_cli_exe``.
@@ -121,7 +124,15 @@ def _init_mp_worker(model_path: str, n_threads: int, language: str) -> None:
         _mp_model = None
 
 
-def _transcribe_mp_worker(audio: Any) -> str:
+def _interactive_audio_context(sample_count: int) -> int:
+    """Bound encoder padding, never the recording: 16 kHz, 50 encoder frames/s."""
+    import math
+    frames = max(256, math.ceil(sample_count / 320) + 64)
+    # Zero preserves normal 30-second windows for long/multi-window recordings.
+    return frames if frames < 1500 else 0
+
+
+def _transcribe_mp_worker(audio: Any, source: str = "meeting") -> str:
     """Ejecuta la transcripción en el proceso hijo usando el modelo global."""
     global _mp_model
     if _mp_model is None:
@@ -133,8 +144,10 @@ def _transcribe_mp_worker(audio: Any) -> str:
     except ImportError:
         audio_data = audio
 
+    context = _interactive_audio_context(len(audio_data)) if source == "interactive" else 0
+    # Model overrides persist: explicitly restore full context for other sources.
     text = " ".join(
-        segment.text for segment in _mp_model.transcribe(audio_data)
+        segment.text for segment in _mp_model.transcribe(audio_data, audio_ctx=context)
         if getattr(segment, "text", "").strip()
     ).strip()
     return text
@@ -370,7 +383,7 @@ class TranscriptionService:
                             "", request.source, error=str(exc))
                 else:
                     # ── Backend CPU (pywhispercpp aislado) ────────────
-                    future = self._pool.submit(_transcribe_mp_worker, request.audio)
+                    future = self._pool.submit(_transcribe_mp_worker, request.audio, request.source)
                     while True:
                         if self._stop.is_set():
                             future.cancel()

@@ -27,6 +27,16 @@ class TraceConfig:
     trace_excluded_apps: list[str] = field(default_factory=list)
     clipboard_max_chars: int = 10000
     meeting_metadata_provider: Any = None
+    meeting_detector: Any = None
+    meeting_capture_factory: Any = None
+    meeting_vad_factory: Any = None
+    meeting_speaker_factory: Any = None
+    meeting_poll_seconds: float = 1.0
+    meeting_segment_seconds: float = 12.0
+    meeting_silence_seconds: float = 0.6
+    meeting_buffer_seconds: float = 30.0
+    meeting_end_grace_seconds: float = 5.0
+    meeting_asr_timeout_seconds: float = 120.0
 
     @classmethod
     def from_mapping(cls, values: Optional[Dict[str, Any]] = None) -> "TraceConfig":
