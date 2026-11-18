@@ -1,0 +1,8 @@
+{
+  "version": "1.6.1",
+  "architecture": "windows-x64",
+  "source_url": "https://downloads.xiph.org/releases/opus/opus-1.6.1.tar.gz",
+  "source_sha256": "6ffcb593207be92584df15b32466ed64bbec99109f007c82205f0194572411a1",
+  "dll_sha256": "bb91a620ad88874e1554672a9191a95786aae5f8d0e9450bca828b34527fab5d",
+  "license_sha256": "01e1167d54a096d123cf6dfbbeb19587278845c6481d2d66d545669846079551"
+}

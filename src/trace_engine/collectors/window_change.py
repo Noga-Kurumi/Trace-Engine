@@ -24,19 +24,6 @@ EVENT_SYSTEM_FOREGROUND = 0x0003
 WINEVENT_OUTOFCONTEXT = 0x0000
 WM_QUIT = 0x0012
 
-# Firma del callback WinEventProc.
-_WIN_EVENT_PROC = ctypes.WINFUNCTYPE(
-    None,
-    wintypes.HANDLE,  # hWinEventHook
-    wintypes.DWORD,   # event
-    wintypes.HWND,    # hwnd
-    wintypes.LONG,    # idObject
-    wintypes.LONG,    # idChild
-    wintypes.DWORD,   # idEventThread
-    wintypes.DWORD,   # dwmsEventTime
-)
-
-
 def get_foreground_window_info() -> tuple:
     """(app_name, window_title) de la ventana en primer plano.
 
@@ -105,6 +92,17 @@ class WindowChangeCollector:
         import win32gui  # pywin32 (message loop + GetWindowText)
 
         self._thread_id = threading.get_native_id()
+        # Firma del callback WinEventProc.
+        _WIN_EVENT_PROC = ctypes.WINFUNCTYPE(
+            None,
+            wintypes.HANDLE,  # hWinEventHook
+            wintypes.DWORD,   # event
+            wintypes.HWND,    # hwnd
+            wintypes.LONG,    # idObject
+            wintypes.LONG,    # idChild
+            wintypes.DWORD,   # idEventThread
+            wintypes.DWORD,   # dwmsEventTime
+        )
         self._callback = _WIN_EVENT_PROC(self._on_foreground)
         self._hook = self._user32.SetWinEventHook(
             EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,

@@ -24,8 +24,9 @@ _CLEANUP_INTERVAL_S = 3600  # limpieza de la base circular cada hora
 class ContextCollector:
     """Arranca/para los recolectores pasivos y la limpieza periódica."""
 
-    def __init__(self, config=None, db: Optional[TimelineDB] = None):
+    def __init__(self, config=None, db: Optional[TimelineDB] = None, *, collector_factories=None):
         self.config = config or {}
+        self.collector_factories = dict(collector_factories or {})
         self._owns_db = db is None
         self.db = db if db is not None else TimelineDB()
         self.retention_hours = float(self.config.get("timeline_retention_hours", 72))
@@ -38,21 +39,35 @@ class ContextCollector:
 
     def _build_collectors(self) -> None:
         """Instancia los recolectores; el OCR y el meeting reciben la config."""
-        from trace_engine.collectors.clipboard import ClipboardCollector
-        from trace_engine.collectors.screen_ocr import ScreenOcrCollector
-        from trace_engine.collectors.window_change import WindowChangeCollector
+        self._collectors = []
+        for name, flag in (('window', None), ('clipboard', 'trace_clipboard_enabled'),
+                           ('screen', 'trace_screen_enabled'), ('meeting', 'meeting_detection_enabled')):
+            if flag and not self.config.get(flag, True):
+                continue
+            try:
+                if name in self.collector_factories:
+                    factory = self.collector_factories[name]
+                else:
+                    factory = self._default_factory(name)
+                collector = factory(self.db, config=self.config) if factory is not None else None
+                if collector is not None:
+                    self._collectors.append(collector)
+            except Exception:
+                logger.exception("Could not construct TRACE collector %s", name)
 
-        self._collectors = [WindowChangeCollector(self.db, config=self.config)]
-        if self.config.get("trace_clipboard_enabled", True):
-            self._collectors.append(ClipboardCollector(self.db, config=self.config))
-        if self.config.get("trace_screen_enabled", True):
-            self._collectors.append(ScreenOcrCollector(self.db, config=self.config))
-
-        # Audio de reuniones (fase C): solo si la detección está habilitada.
-        if self.config.get("meeting_detection_enabled", True):
-            from trace_engine.collectors.meeting_audio import MeetingAudioCollector
-
-            self._collectors.append(MeetingAudioCollector(self.db, config=self.config))
+    @staticmethod
+    def _default_factory(name):
+        if name == 'window':
+            from trace_engine.collectors.window_change import WindowChangeCollector
+            return WindowChangeCollector
+        if name == 'clipboard':
+            from trace_engine.collectors.clipboard import ClipboardCollector
+            return ClipboardCollector
+        if name == 'screen':
+            from trace_engine.collectors.screen_ocr import ScreenOcrCollector
+            return ScreenOcrCollector
+        from trace_engine.collectors.meeting_audio import MeetingAudioCollector
+        return MeetingAudioCollector
 
     # -------------------------------------------------------------- lifecycle
 

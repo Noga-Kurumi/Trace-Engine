@@ -117,19 +117,18 @@ Screen, clipboard and window collectors record observation provenance, and the
 host can supply capture exclusion/privacy callbacks. The engine does not bypass
 the application's privacy policy, mutate documents or dispatch assistant tools.
 
-## Encrypted media history preview
+## Encrypted media history
 
-These interfaces are validated in the Lindsay Desktop TRACE wheel
-`0.1.0.dev0+snapshot.01fd292b9c39`. That wheel contains the encrypted-media
-implementation. An install from the upstream source branch currently provides
-the timeline, text retrieval and live meeting APIs documented above.
+TRACE provides opt-in archives for screenshots and meeting audio. Host
+applications choose what to capture, which OCR and speech models to use, and
+when background transcription can run.
 
 Use `trace_engine.visual_archive.VisualArchive` with an existing timeline
 database. `record(session_id, captured_at, jpeg)` ties an image to a foreground
 session. Use Unix timestamps in seconds. `select(start, end, point=...)` finds
 one nearby capture for a point or up to three across a range. `read(snapshot)`
-returns the JPEG. The archive caps disk usage and supports
-retention via `prune(cutoff)`. The Windows
+returns the JPEG. The [visual archive](src/trace_engine/visual_archive.py) caps
+disk usage and supports retention via `prune(cutoff)`. The Windows
 `trace_engine.collectors.visual_history.VisualWindowCollector` tracks focus,
 takes periodic screenshots only for focused windows, and deduplicates
 unchanged frames. It accepts the host's grabber, OCR reader, exclusion filters
@@ -138,8 +137,9 @@ handle and exclusion callback, plus the keyword `window_only`.
 
 `trace_engine.call_archive.CallArchive` stores bounded clips and cached
 transcripts. Its `select` searches past clips, including keyword matches from
-its keyed index. `trace_engine.call_index.CallIndex` prioritizes old clips for
-background indexing and coalesces lookups for a clip already being transcribed.
+its keyed index. `trace_engine.call_index.CallIndex` transcribes recent clips
+on request. Background indexing defaults to clips older than 15 minutes and
+works oldest first. Concurrent lookups for the same clip share the transcription.
 The host provides `service()` and `admit(service, background)` callbacks to
 choose its current ASR service and enforce its own resource policy. The service
 accepts `submit(audio, source=..., priority=...)` and returns a future with
@@ -170,9 +170,10 @@ the packaged libopus on Windows x64. Other hosts can pass
 deflate-compressed PCM when the codec is unavailable. Stored Opus clips need
 a compatible decoder.
 Existing DPAPI images, Opus clips, and older compressed PCM remain readable
-with the same Windows profile and a compatible codec. The preview wheel
-includes the libopus license and build manifest in
-`trace_engine/assets/windows_x64`.
+with the same Windows profile and a compatible codec. The package includes the
+[libopus license and build manifest](src/trace_engine/assets/windows_x64). Use
+[the build script](tools/build_trace_opus.ps1) to rebuild the Windows x64 codec
+from verified Xiph source.
 
 ## Source validation and snapshot distribution
 

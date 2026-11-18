@@ -74,8 +74,17 @@ class _DeferredSpeakers:
 
 
 class MeetingAudioCollector:
-    def __init__(self,db,config=None):
+    """Capture validated meeting streams and deliver completed speech segments.
+
+    segment_sink(segment) receives each speaker-labelled clip on a worker
+    thread. Supplying a sink enables capture without live transcription.
+    accept_app(app_name), when provided, filters detector metadata.
+    """
+
+    def __init__(self, db, config=None, *, segment_sink=None, accept_app=None):
         self.db=db;self.config=config or {}
+        self._segment_sink = segment_sink
+        self._accept_app = accept_app
         self._transcription_service=self.config.get('transcription_service')
         self._detector=self.config.get('meeting_detector')
         self._capture_factory=self.config.get('meeting_capture_factory')
@@ -110,8 +119,15 @@ class MeetingAudioCollector:
         self._transcribe_thread.start();self._poll_thread.start()
 
     def stop(self):
-        self._stop_event.set()
-        with self._lifecycle:self._end_session()
+        if self._segment_sink is not None:
+            # End native producers before the writer exits so their final clips drain.
+            with self._lifecycle:
+                self._end_session()
+                self._stop_event.set()
+        else:
+            self._stop_event.set()
+            with self._lifecycle:
+                self._end_session()
         for thread in (self._poll_thread,self._transcribe_thread):
             if thread and thread is not threading.current_thread():thread.join(timeout=3.5)
         stopped=all(not t or not t.is_alive() for t in
@@ -130,7 +146,10 @@ class MeetingAudioCollector:
     def set_playback_active(self,active):self.set_capture_paused(active,'assistant_playback')
 
     def _detect_state(self):
-        return self._detector() if callable(self._detector) else {'active':False,'reason':'meeting_adapter_unavailable'}
+        state = self._detector() if callable(self._detector) else {'active':False,'reason':'meeting_adapter_unavailable'}
+        if state.get('active') and self._accept_app is not None and not self._accept_app(state.get('app_name')):
+            return dict(state, active=False)
+        return state
 
     def _detect_meeting(self):return bool(self._detect_state().get('active'))
 
@@ -161,7 +180,10 @@ class MeetingAudioCollector:
         if self._session and self._capture_disabled and time.monotonic()>=self._retry_after:self._end_session()
 
     def _begin_session(self,candidate,key):
-        if not self._transcription_service or not self._capture_factory or any(t.is_alive() for t in self._capture_threads):return
+        if self._segment_sink is None and self._transcription_service is None:
+            return
+        if not self._capture_factory or any(t.is_alive() for t in self._capture_threads):
+            return
         pid=candidate.get('pid')
         if type(pid) is not int or pid<=0 or not candidate.get('app_name'):return
         start=time.time()
@@ -264,6 +286,15 @@ class MeetingAudioCollector:
             self._segments.put_nowait(segment)
         return True
 
+    @staticmethod
+    def _label_speaker(segment):
+        if segment.source == 'audio_out' and segment.speaker_tracker:
+            try:
+                return replace(segment, speaker_id=segment.speaker_tracker.assign(segment.audio))
+            except Exception:
+                logger.debug('Speaker ID unavailable; preserving segment', exc_info=True)
+        return segment
+
     def _transcribe_loop(self):
         from trace_engine.transcription import TranscriptionPriority
         while not self._stop_event.is_set() or not self._segments.empty():
@@ -271,6 +302,9 @@ class MeetingAudioCollector:
             except queue.Empty:continue
             with self._queue_lock:self._queued_samples-=len(segment.audio)
             try:
+                if self._segment_sink is not None:
+                    self._segment_sink(self._label_speaker(segment))
+                    continue
                 if self._stop_event.is_set():raise InterruptedError('Meeting collection stopped')
                 future=self._transcription_service.submit(segment.audio,source='meeting',priority=TranscriptionPriority.MEETING)
                 deadline=time.monotonic()+float(self.config.get('meeting_asr_timeout_seconds',120))
@@ -283,13 +317,18 @@ class MeetingAudioCollector:
                 text=getattr(result,'text','')
                 if not isinstance(text,str) or not text.strip() or text.strip().upper() in FILTERED_MARKERS:
                     self._state(segment.session_id,reason='asr_no_text',dropped_seconds=len(segment.audio)/RATE);continue
-                if segment.source=='audio_out' and segment.speaker_tracker:
-                    try:segment=replace(segment,speaker_id=segment.speaker_tracker.assign(segment.audio))
-                    except Exception:logger.debug('Speaker ID unavailable; preserving transcript',exc_info=True)
-                if not self.db.record_meeting_segment(segment,text):
+                if not self.db.record_meeting_segment(self._label_speaker(segment),text):
                     logger.info('Discarded meeting result whose session was deleted or excluded')
             except Exception as error:
-                reason='collection_stopped' if isinstance(error,InterruptedError) else 'asr_timeout' if isinstance(error,TimeoutError) else 'asr_error'
+                if self._segment_sink is not None:
+                    reason = 'call_archive_error'
+                    logger.warning('Could not archive TRACE call clip', exc_info=True)
+                elif isinstance(error, InterruptedError):
+                    reason = 'collection_stopped'
+                elif isinstance(error, TimeoutError):
+                    reason = 'asr_timeout'
+                else:
+                    reason = 'asr_error'
                 self._state(segment.session_id,reason=reason,dropped_seconds=len(segment.audio)/RATE)
                 logger.debug('Meeting segment not committed: %s',reason)
             finally:

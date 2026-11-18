@@ -24,10 +24,10 @@ class TraceEngine:
     """
 
     def __init__(self, config: Optional[Dict[str, Any] | TraceConfig] = None,
-                 db: Optional[TimelineDB] = None, transcriber=None):
+                 db: Optional[TimelineDB] = None, transcriber=None, *, collector_factories=None):
         self.config = (config if isinstance(config, TraceConfig)
                        else TraceConfig.from_mapping(config))
-        values = self.config.as_dict()
+        self.collector_factories = dict(collector_factories or {})
         self.db = db or TimelineDB(self.config.db_path)
         self.transcription_service = None
         self.streaming_transcriber = None
@@ -77,11 +77,13 @@ class TraceEngine:
             from trace_engine.collectors.coordinator import ContextCollector
             collector_config = self.config.as_dict()
             collector_config["transcription_service"] = self.transcription_service
-            self.collector = ContextCollector(config=collector_config, db=self.db)
+            self.collector = ContextCollector(config=collector_config, db=self.db,
+                                              collector_factories=self.collector_factories)
             self.collector.start()
         except Exception as exc:
             logger.warning("No se pudieron activar los recolectores nativos: %s",
                            exc, exc_info=True)
+            self.pause_collectors()
 
     def pause_collectors(self) -> None:
         """Pause context capture without closing shared speech or storage."""

@@ -36,4 +36,4 @@ mcp = [
 where = ["src"]
 
 [tool.setuptools.package-data]
-trace_engine = ["py.typed"]
+trace_engine = ["py.typed", "assets/windows_x64/*"]
